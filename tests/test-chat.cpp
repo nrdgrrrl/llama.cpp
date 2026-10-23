@@ -6712,6 +6712,89 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Basic content only - final channel
         tst.test("<|channel|>final<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
 
+        // Final constraints are optional with or without tools and response formatting.
+        for (bool has_tools : { false, true }) {
+            std::vector<common_chat_tool> tools;
+            std::vector<common_chat_msg> messages = { message_user };
+            if (has_tools) {
+                tools = { special_function_tool };
+                common_chat_msg tool_reply;
+                tool_reply.role = "tool";
+                tool_reply.tool_name = "special_function";
+                tool_reply.content = "1";
+                messages.insert(messages.end(), { message_assist_call, tool_reply });
+            }
+            for (bool has_schema : { false, true }) {
+                for (const std::string constraint : { "", " json", " <|constrain|>json", "<|constrain|>json" }) {
+                    for (bool has_analysis : { false, true }) {
+                        const std::string analysis = has_analysis ? "<|channel|>analysis<|message|>Thinking<|end|><|start|>assistant" : "";
+                        tst.test(analysis + "<|channel|>final" + constraint + "<|message|>{\"value\":1}")
+                            .tools(tools)
+                            .messages(messages)
+                            .json_schema(has_schema ? R"({"type":"object"})" : "")
+                            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                            .expect_reasoning(has_analysis ? "Thinking" : "")
+                            .expect_content(R"({"value":1})")
+                            .run();
+                    }
+                }
+
+                // Do not expose an incomplete constraint header as content during streaming.
+                for (const std::string header : {
+                         "<|channel|>final ",
+                         "<|channel|>final <|constrain|",
+                         "<|channel|>final <|constrain|>",
+                         "<|channel|>final <|constrain|>js",
+                     }) {
+                    tst.test(header)
+                        .tools(tools)
+                        .json_schema(has_schema ? R"({"type":"object"})" : "")
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .is_partial(true)
+                        .expect_content("")
+                        .run();
+                }
+                tst.test("<|channel|>analysis<|message|>Thinking<|end|><|start|>assistant"
+                         "<|channel|>final <|constrain|>json<|message|>{\"value\":")
+                    .tools(tools)
+                    .json_schema(has_schema ? R"({"type":"object"})" : "")
+                    .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                    .is_partial(true)
+                    .expect_reasoning("Thinking")
+                    .expect_content(R"({"value":)")
+                    .run();
+            }
+        }
+
+        // Malformed headers must still fail the complete parse.
+        auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
+        for (bool has_tools : { false, true }) {
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            if (has_tools) {
+                inputs.tools = { special_function_tool };
+            }
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            common_chat_parser_params pp(params);
+            for (const std::string header : {
+                     "<|channel|>final <|constrain|><|message|>",
+                     "<|channel|>final <|constrain|>json!<|message|>",
+                     "<|channel|>final <|constrain|>json <|constrain|>json<|message|>",
+                     "<|channel|>final <|constraint|>json<|message|>",
+                     "<|channel|>final <|constrain|>json",
+                     "<|channel|>unknown <|constrain|>json<|message|>",
+                 }) {
+                bool rejected = false;
+                try {
+                    common_chat_peg_parse(params.parser, common_chat_input(header + R"({"value":1})"), false, pp);
+                } catch (const std::runtime_error & e) {
+                    assert_contains(e.what(), "The model produced output that does not match the expected peg-native format");
+                    rejected = true;
+                }
+                assert_equals(true, rejected);
+            }
+        }
+
         // Basic content only - commentary channel
         tst.test("<|channel|>commentary<|message|>Hello, world!\nWhat's up?").expect(message_assist).run();
 
@@ -6766,6 +6849,15 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .run();
+
+        for (bool is_partial : { false, true }) {
+            tst.test("<|channel|>analysis to=functions.special_function <|constrain|>json<|message|>{\"arg1\": 1}")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({ special_function_tool })
+                .is_partial(is_partial)
+                .expect(message_assist_call)
+                .run();
+        }
 
         // Tool call with reasoning + content (analysis first, then tool call)
         tst.test(
